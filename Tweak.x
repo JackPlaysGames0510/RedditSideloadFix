@@ -25,9 +25,9 @@ static void createDirectoryIfNotExists(NSURL *URL) {
 %hook NSBundle
 
 - (NSString *)bundleIdentifier {
-  NSArray *address = [NSThread callStackReturnAddresses];
+  NSArray <NSNumber *>*addresses = NSThread.callStackReturnAddresses;
   Dl_info info;
-  if (dladdr((void *)[address[2] longLongValue], &info) == 0) return %orig;
+  if (dladdr((void *)[addresses[2] longLongValue], &info) == 0) return %orig;
   NSString *path = [NSString stringWithUTF8String:info.dli_fname];
   if ([path hasPrefix:NSBundle.mainBundle.bundlePath]) return BUNDLE_ID;
   return %orig;
@@ -73,7 +73,9 @@ static void loadKeychainAccessGroup() {
   if (ret == errSecSuccess && result) {
     NSDictionary *resultDict = (__bridge id)result;
     keychainAccessGroup = resultDict[(__bridge id)kSecAttrAccessGroup];
-    originalKeychainAccessGroup = [keychainAccessGroup stringByReplacingCharactersInRange:NSMakeRange(0, 10) withString:TEAM_ID];
+    originalKeychainAccessGroup =
+        [keychainAccessGroup stringByReplacingCharactersInRange:NSMakeRange(0, 10)
+                                                     withString:TEAM_ID];
     NSLog(@"loaded keychainAccessGroup: %@", keychainAccessGroup);
   }
 
@@ -169,7 +171,52 @@ static void initSideloadedFixes() {
   %init(SideloadedFixes);
 }
 
+static NSString *originalBundleIdentifier;
+
+static void recaptcha_hook(id self, SEL _cmd, id arg) {
+  Class cls = object_getClass(self);
+  SEL orig_name = NSSelectorFromString([@"orig_" stringByAppendingString:NSStringFromSelector(_cmd)]);
+  void (*orig_imp)(id, SEL, id);
+  Method method = class_getInstanceMethod(cls, orig_name);
+
+  if (!method) {
+    method = class_getClassMethod(cls, orig_name);
+    if (method) {
+      orig_imp = (void (*)(id, SEL, id))method_getImplementation(method);
+      orig_imp(self, orig_name, arg);
+    }
+    // In case there is no method (is this possible? idk)
+    return;
+  }
+
+  if ([arg isKindOfClass:NSString.class] && [(NSString *)arg isEqualToString:originalBundleIdentifier])
+    arg = BUNDLE_ID;
+
+  orig_imp = (void (*)(id, SEL, id))method_getImplementation(method);
+  orig_imp(self, orig_name, arg);
+}
+
+static BOOL (*orig_class_addMethod)(Class, SEL, IMP, const char *);
+static BOOL hook_class_addMethod(Class cls, SEL name, IMP imp, const char *types) {
+  NSString *methodEncoding = [@(types) stringByReplacingOccurrencesOfString:@"[0-9]+" withString:@"" options:NSRegularExpressionSearch range:NSMakeRange(0, strlen(types))];
+  if ([class_getSuperclass(cls) isEqual:objc_getClass("RCAx_GPBMessage")] && [methodEncoding isEqualToString:@"v@:@"]) {
+    if (!orig_class_addMethod(cls, NSSelectorFromString([@"orig_" stringByAppendingString:NSStringFromSelector(name)]), imp, types))
+      return orig_class_addMethod(cls, name, imp, types);
+    imp = (IMP)recaptcha_hook;
+  }
+
+  return orig_class_addMethod(cls, name, imp, types);
+}
+
+static void initRecaptchaFix() {
+  rebind_symbols((struct rebinding[]){{
+    "class_addMethod", (void *)hook_class_addMethod, (void **)&orig_class_addMethod,
+  }}, 1);
+}
+
 %ctor {
+  originalBundleIdentifier = NSBundle.mainBundle.bundleIdentifier;
   %init;
   initSideloadedFixes();
+  initRecaptchaFix();
 }
